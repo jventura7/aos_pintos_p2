@@ -37,8 +37,16 @@ tid_t process_execute (const char *file_name)
     return TID_ERROR;
   strlcpy (fn_copy, file_name, PGSIZE);
 
+  // Parse file_name ex. 'ls a b c' -> 'ls''
+  char* file_name_mutable = palloc_get_page(0);
+  strlcpy(file_name_mutable, file_name, PGSIZE);
+
+  char* save;
+  char* program_name = strtok_r(file_name_mutable, " ", &save);
+  palloc_free_page(file_name_mutable);
+
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
+  tid = thread_create (program_name, PRI_DEFAULT, start_process, fn_copy);
   if (tid == TID_ERROR)
     palloc_free_page (fn_copy);
   return tid;
@@ -74,6 +82,75 @@ static void start_process (void *file_name_)
   NOT_REACHED ();
 }
 
+/* Save arguments onto user stack */
+void save_arguments(const char *file_name, void **esp) {
+  int argc = 0;
+  char* save;
+  char* token;
+  char* argv[128];
+
+  // Parse arguments
+  for (token = strtok_r(file_name, " ", &save); token != NULL; token = strtok_r(NULL, " ", &save)) {
+    printf("token: %s\n", token);
+    argv[argc] = token;
+    argc ++;
+  }
+
+  printf("Parsed %d arguments:\n", argc);
+  for (int i = 0; i < argc; i++) {
+    printf("argv[%d] = '%s'\n", i, argv[i]);
+}
+
+  // Store arguments onto the user stack from right to left
+  for (int i = argc - 1; i >= 0; i--) {
+    void *initial_esp = *esp;
+    printf("Initial ESP: %p\n", initial_esp);
+
+
+
+    int arg_length = strlen(argv[i]) + 1;
+    *esp = (void*)((uint8_t *)(*esp) - arg_length);
+    printf("Storing argument '%s' at address %p\n", argv[i], *esp);
+    printf("Final ESP: %p\n", *esp);
+    ptrdiff_t stack_used = (uint8_t *)initial_esp - (uint8_t *)*esp;
+    printf("Stack space used: %td bytes\n", stack_used);
+
+
+    memcpy(*esp, argv[i], arg_length);
+    argv[i] = *esp;
+  }
+
+  // Word align (handle 4-byte align)
+  uintptr_t casted_ptr = (uintptr_t)*esp;
+  uint8_t word_align = (4 - (casted_ptr % 4)) % 4;
+  *esp = (void *)((uint8_t *)(*esp) - word_align);
+  if (word_align > 0) {
+    memset(*esp, 0, word_align);
+  }
+
+  // Argument's address
+  *esp = (void *)((char *)(*esp) - sizeof(char *));
+  *(char **)(*esp) = 0;
+
+  for (int i = argc - 1; i >= 0; i--) {
+    *esp = (void *)((char *)(*esp) - sizeof(char *));
+    *(char **)(*esp) = argv[i];
+  }
+
+  // Starting address of argv
+  char **argv_addr = (char **)*esp;
+  *esp = (void *)((char *)(*esp) - sizeof(char**));
+  *(char ***)(*esp) = argv_addr;
+
+  // Add space for argc
+  *esp = (void *)((uint8_t *)(*esp) - sizeof(int));
+  *(int *)(*esp) = argc;
+  
+  // Return address
+  *esp = (void *)((uint8_t *)(*esp) - sizeof(void *));
+  *(void **)(*esp) = 0;
+}
+
 /* Waits for thread TID to die and returns its exit status.  If
    it was terminated by the kernel (i.e. killed due to an
    exception), returns -1.  If TID is invalid or if it was not a
@@ -83,7 +160,10 @@ static void start_process (void *file_name_)
 
    This function will be implemented in problem 2-2.  For now, it
    does nothing. */
-int process_wait (tid_t child_tid UNUSED) { return -1; }
+int process_wait (tid_t child_tid UNUSED) { 
+  while(1){};
+  return 1;
+ }
 
 /* Free the current process's resources. */
 void process_exit (void)
@@ -187,7 +267,7 @@ struct Elf32_Phdr
 #define PF_W 2 /* Writable. */
 #define PF_R 4 /* Readable. */
 
-static bool setup_stack (void **esp);
+static bool setup_stack (void **esp, const char* file_name);
 static bool validate_segment (const struct Elf32_Phdr *, struct file *);
 static bool load_segment (struct file *file, off_t ofs, uint8_t *upage,
                           uint32_t read_bytes, uint32_t zero_bytes,
@@ -213,10 +293,16 @@ bool load (const char *file_name, void (**eip) (void), void **esp)
   process_activate ();
 
   /* Open executable file. */
-  file = filesys_open (file_name);
+  char* file_name_mutable = palloc_get_page(0);
+  strlcpy(file_name_mutable, file_name, PGSIZE);
+
+  char* save;
+  char* program_name = strtok_r(file_name_mutable, " ", &save);
+
+  file = filesys_open (program_name);
   if (file == NULL)
     {
-      printf ("load: %s: open failed\n", file_name);
+      printf ("load: %s: open failed\n", program_name);
       goto done;
     }
 
@@ -289,9 +375,10 @@ bool load (const char *file_name, void (**eip) (void), void **esp)
             break;
         }
     }
+  palloc_free_page(file_name_mutable);
 
   /* Set up stack. */
-  if (!setup_stack (esp))
+  if (!setup_stack (esp, file_name))
     goto done;
 
   /* Start address. */
@@ -414,8 +501,7 @@ static bool load_segment (struct file *file, off_t ofs, uint8_t *upage,
 
 /* Create a minimal stack by mapping a zeroed page at the top of
    user virtual memory. */
-static bool setup_stack (void **esp)
-{
+static bool setup_stack (void **esp, const char *file_name) {
   uint8_t *kpage;
   bool success = false;
 
@@ -423,8 +509,10 @@ static bool setup_stack (void **esp)
   if (kpage != NULL)
     {
       success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage, true);
-      if (success)
+      if (success) {
         *esp = PHYS_BASE;
+        save_arguments(file_name, esp);
+      }
       else
         palloc_free_page (kpage);
     }
